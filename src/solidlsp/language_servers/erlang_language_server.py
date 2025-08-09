@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 
+import psutil
 from overrides import override
 
 from solidlsp.ls import SolidLanguageServer
@@ -58,10 +59,19 @@ class ErlangLanguageServer(SolidLanguageServer):
         # Add server readiness tracking like Elixir
         self.server_ready = threading.Event()
 
-        # Set timeout for Erlang LS - adjust based on environment
+        # Set very aggressive timeout for Erlang LS in CI due to severe instability
         is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
-        request_timeout = 300.0 if is_ci else 120.0  # 5 minutes for CI, 2 minutes for local
+        if is_ci:
+            # Use very short timeout in CI to prevent hangs - better to fail fast than hang
+            request_timeout = 45.0  # 45 seconds max for any single request
+        else:
+            request_timeout = 60.0  # 1 minute for local
         self.set_request_timeout(request_timeout)
+
+        # Track request timing for circuit breaker
+        self._request_count = 0
+        self._timeout_count = 0
+        self._last_timeout_time = 0
 
     def _check_erlang_installation(self) -> bool:
         """Check if Erlang/OTP is available."""
@@ -70,6 +80,30 @@ class ErlangLanguageServer(SolidLanguageServer):
             return result.returncode == 0
         except (subprocess.SubprocessError, FileNotFoundError):
             return False
+
+    def _force_kill_if_stuck(self):
+        """Force kill the Erlang LS process if it appears stuck."""
+        try:
+            if hasattr(self.server, "process") and self.server.process:
+                pid = self.server.process.pid
+                if psutil.pid_exists(pid):
+                    process = psutil.Process(pid)
+                    # Check if process is consuming CPU or just hung
+                    cpu_percent = process.cpu_percent(interval=0.1)
+                    self.logger.log(f"Erlang LS process {pid} CPU usage: {cpu_percent}%", logging.INFO)
+
+                    # If CPU is very low, the process might be deadlocked
+                    if cpu_percent < 1.0:
+                        self.logger.log(f"Force killing potentially deadlocked Erlang LS process {pid}", logging.WARNING)
+                        try:
+                            process.terminate()
+                            time.sleep(2)
+                            if process.is_running():
+                                process.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+        except Exception as e:
+            self.logger.log(f"Error in force kill check: {e}", logging.DEBUG)
 
     @classmethod
     def _get_erlang_version(cls):
@@ -251,3 +285,31 @@ class ErlangLanguageServer(SolidLanguageServer):
             return True
         # Don't ignore Erlang source files, header files, or configuration files
         return False
+
+    def request_containing_symbol(self, file_path, line_number, column_number, include_body=False):
+        """Override to add timeout logging."""
+        start_time = time.time()
+        try:
+            result = super().request_containing_symbol(file_path, line_number, column_number, include_body)
+            elapsed = time.time() - start_time
+            if elapsed > 10:  # Log slow requests
+                self.logger.log(f"Slow Erlang LS containing symbol request: {elapsed:.1f}s", logging.INFO)
+            return result
+        except Exception as e:
+            elapsed = time.time() - start_time
+            self.logger.log(f"Erlang LS containing symbol request failed after {elapsed:.1f}s: {e}", logging.WARNING)
+            raise
+
+    def request_referencing_symbols(self, file_path, line_number, column_number):
+        """Override to add timeout logging."""
+        start_time = time.time()
+        try:
+            result = super().request_referencing_symbols(file_path, line_number, column_number)
+            elapsed = time.time() - start_time
+            if elapsed > 10:  # Log slow requests
+                self.logger.log(f"Slow Erlang LS referencing symbols request: {elapsed:.1f}s", logging.INFO)
+            return result
+        except Exception as e:
+            elapsed = time.time() - start_time
+            self.logger.log(f"Erlang LS referencing symbols request failed after {elapsed:.1f}s: {e}", logging.WARNING)
+            raise
