@@ -59,11 +59,11 @@ class ErlangLanguageServer(SolidLanguageServer):
         # Add server readiness tracking like Elixir
         self.server_ready = threading.Event()
 
-        # Set very aggressive timeout for Erlang LS in CI due to severe instability
+        # Set extremely aggressive timeout for Erlang LS in CI due to severe instability
         is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
         if is_ci:
-            # Use very short timeout in CI to prevent hangs - better to fail fast than hang
-            request_timeout = 45.0  # 45 seconds max for any single request
+            # Use extremely short timeout in CI - Erlang LS is too unstable
+            request_timeout = 20.0  # 20 seconds max for any single request
         else:
             request_timeout = 60.0  # 1 minute for local
         self.set_request_timeout(request_timeout)
