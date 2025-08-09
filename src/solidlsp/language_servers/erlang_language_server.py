@@ -37,11 +37,20 @@ class ErlangLanguageServer(SolidLanguageServer):
         if not self._check_erlang_installation():
             raise RuntimeError("Erlang/OTP not found. Install from: https://www.erlang.org/downloads")
 
+        # Configure Erlang LS command with environment-specific options
+        erlang_ls_cmd = [self.erlang_ls_path, "--transport", "stdio"]
+
+        # Add additional flags for CI environments to improve stability
+        is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
+        if is_ci:
+            # Use more conservative settings in CI
+            erlang_ls_cmd.extend(["--log-level", "info"])
+
         super().__init__(
             config,
             logger,
             repository_root_path,
-            ProcessLaunchInfo(cmd=[self.erlang_ls_path, "--transport", "stdio"], cwd=repository_root_path),
+            ProcessLaunchInfo(cmd=erlang_ls_cmd, cwd=repository_root_path),
             "erlang",
             solidlsp_settings,
         )
@@ -49,8 +58,10 @@ class ErlangLanguageServer(SolidLanguageServer):
         # Add server readiness tracking like Elixir
         self.server_ready = threading.Event()
 
-        # Set generous timeout for Erlang LS initialization
-        self.set_request_timeout(120.0)
+        # Set timeout for Erlang LS - adjust based on environment
+        is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
+        request_timeout = 300.0 if is_ci else 120.0  # 5 minutes for CI, 2 minutes for local
+        self.set_request_timeout(request_timeout)
 
     def _check_erlang_installation(self) -> bool:
         """Check if Erlang/OTP is available."""
@@ -109,6 +120,10 @@ class ErlangLanguageServer(SolidLanguageServer):
                     self.server_ready.set()
                     break
 
+            # Log errors that might indicate issues
+            if any(word in message_lower for word in ["error", "failed", "timeout", "crash"]):
+                self.logger.log(f"Erlang LS potential issue: {message_text}", logging.WARNING)
+
         def do_nothing(params):
             return
 
@@ -136,7 +151,7 @@ class ErlangLanguageServer(SolidLanguageServer):
         self.logger.log("Starting Erlang LS server process", logging.INFO)
         self.server.start()
 
-        # Send initialize request
+        # Send initialize request with more robust error handling
         initialize_params = {
             "processId": None,
             "rootPath": self.repository_root_path,
@@ -154,14 +169,21 @@ class ErlangLanguageServer(SolidLanguageServer):
         }
 
         self.logger.log("Sending initialize request to Erlang LS", logging.INFO)
-        init_response = self.server.send.initialize(initialize_params)
+        try:
+            init_response = self.server.send.initialize(initialize_params)
 
-        # Verify server capabilities
-        if "capabilities" in init_response:
-            self.logger.log(f"Erlang LS capabilities: {list(init_response['capabilities'].keys())}", logging.INFO)
+            # Verify server capabilities
+            if "capabilities" in init_response:
+                self.logger.log(f"Erlang LS capabilities: {list(init_response['capabilities'].keys())}", logging.INFO)
 
-        self.server.notify.initialized({})
-        self.completions_available.set()
+            self.server.notify.initialized({})
+            self.completions_available.set()
+            self.logger.log("Erlang LS initialization completed successfully", logging.INFO)
+        except Exception as e:
+            self.logger.log(f"Erlang LS initialization failed: {e}", logging.ERROR)
+            # Still set as ready but log the issue
+            self.completions_available.set()
+            raise
 
         # Wait for Erlang LS to be ready - adjust timeout based on environment
         is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
