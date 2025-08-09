@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 
+import psutil
 from overrides import override
 
 from solidlsp.ls import SolidLanguageServer
@@ -37,11 +38,20 @@ class ErlangLanguageServer(SolidLanguageServer):
         if not self._check_erlang_installation():
             raise RuntimeError("Erlang/OTP not found. Install from: https://www.erlang.org/downloads")
 
+        # Configure Erlang LS command with environment-specific options
+        erlang_ls_cmd = [self.erlang_ls_path, "--transport", "stdio"]
+
+        # Add additional flags for CI environments to improve stability
+        is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
+        if is_ci:
+            # Use more conservative settings in CI
+            erlang_ls_cmd.extend(["--log-level", "info"])
+
         super().__init__(
             config,
             logger,
             repository_root_path,
-            ProcessLaunchInfo(cmd=[self.erlang_ls_path, "--transport", "stdio"], cwd=repository_root_path),
+            ProcessLaunchInfo(cmd=erlang_ls_cmd, cwd=repository_root_path),
             "erlang",
             solidlsp_settings,
         )
@@ -49,8 +59,19 @@ class ErlangLanguageServer(SolidLanguageServer):
         # Add server readiness tracking like Elixir
         self.server_ready = threading.Event()
 
-        # Set generous timeout for Erlang LS initialization
-        self.set_request_timeout(120.0)
+        # Set extremely aggressive timeout for Erlang LS in CI due to severe instability
+        is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
+        if is_ci:
+            # Use extremely short timeout in CI - Erlang LS is too unstable
+            request_timeout = 20.0  # 20 seconds max for any single request
+        else:
+            request_timeout = 60.0  # 1 minute for local
+        self.set_request_timeout(request_timeout)
+
+        # Track request timing for circuit breaker
+        self._request_count = 0
+        self._timeout_count = 0
+        self._last_timeout_time = 0
 
     def _check_erlang_installation(self) -> bool:
         """Check if Erlang/OTP is available."""
@@ -59,6 +80,30 @@ class ErlangLanguageServer(SolidLanguageServer):
             return result.returncode == 0
         except (subprocess.SubprocessError, FileNotFoundError):
             return False
+
+    def _force_kill_if_stuck(self):
+        """Force kill the Erlang LS process if it appears stuck."""
+        try:
+            if hasattr(self.server, "process") and self.server.process:
+                pid = self.server.process.pid
+                if psutil.pid_exists(pid):
+                    process = psutil.Process(pid)
+                    # Check if process is consuming CPU or just hung
+                    cpu_percent = process.cpu_percent(interval=0.1)
+                    self.logger.log(f"Erlang LS process {pid} CPU usage: {cpu_percent}%", logging.INFO)
+
+                    # If CPU is very low, the process might be deadlocked
+                    if cpu_percent < 1.0:
+                        self.logger.log(f"Force killing potentially deadlocked Erlang LS process {pid}", logging.WARNING)
+                        try:
+                            process.terminate()
+                            time.sleep(2)
+                            if process.is_running():
+                                process.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+        except Exception as e:
+            self.logger.log(f"Error in force kill check: {e}", logging.DEBUG)
 
     @classmethod
     def _get_erlang_version(cls):
@@ -109,6 +154,10 @@ class ErlangLanguageServer(SolidLanguageServer):
                     self.server_ready.set()
                     break
 
+            # Log errors that might indicate issues
+            if any(word in message_lower for word in ["error", "failed", "timeout", "crash"]):
+                self.logger.log(f"Erlang LS potential issue: {message_text}", logging.WARNING)
+
         def do_nothing(params):
             return
 
@@ -136,7 +185,7 @@ class ErlangLanguageServer(SolidLanguageServer):
         self.logger.log("Starting Erlang LS server process", logging.INFO)
         self.server.start()
 
-        # Send initialize request
+        # Send initialize request with more robust error handling
         initialize_params = {
             "processId": None,
             "rootPath": self.repository_root_path,
@@ -154,17 +203,25 @@ class ErlangLanguageServer(SolidLanguageServer):
         }
 
         self.logger.log("Sending initialize request to Erlang LS", logging.INFO)
-        init_response = self.server.send.initialize(initialize_params)
+        try:
+            init_response = self.server.send.initialize(initialize_params)
 
-        # Verify server capabilities
-        if "capabilities" in init_response:
-            self.logger.log(f"Erlang LS capabilities: {list(init_response['capabilities'].keys())}", logging.INFO)
+            # Verify server capabilities
+            if "capabilities" in init_response:
+                self.logger.log(f"Erlang LS capabilities: {list(init_response['capabilities'].keys())}", logging.INFO)
 
-        self.server.notify.initialized({})
-        self.completions_available.set()
+            self.server.notify.initialized({})
+            self.completions_available.set()
+            self.logger.log("Erlang LS initialization completed successfully", logging.INFO)
+        except Exception as e:
+            self.logger.log(f"Erlang LS initialization failed: {e}", logging.ERROR)
+            # Still set as ready but log the issue
+            self.completions_available.set()
+            raise
 
         # Wait for Erlang LS to be ready - adjust timeout based on environment
         is_ci = os.getenv("CI") == "true" or os.getenv("GITHUB_ACTIONS") == "true"
+
         is_macos = os.uname().sysname == "Darwin" if hasattr(os, "uname") else False
 
         # macOS in CI can be particularly slow for language server startup
@@ -228,3 +285,31 @@ class ErlangLanguageServer(SolidLanguageServer):
             return True
         # Don't ignore Erlang source files, header files, or configuration files
         return False
+
+    def request_containing_symbol(self, file_path, line_number, column_number, include_body=False):
+        """Override to add timeout logging."""
+        start_time = time.time()
+        try:
+            result = super().request_containing_symbol(file_path, line_number, column_number, include_body)
+            elapsed = time.time() - start_time
+            if elapsed > 10:  # Log slow requests
+                self.logger.log(f"Slow Erlang LS containing symbol request: {elapsed:.1f}s", logging.INFO)
+            return result
+        except Exception as e:
+            elapsed = time.time() - start_time
+            self.logger.log(f"Erlang LS containing symbol request failed after {elapsed:.1f}s: {e}", logging.WARNING)
+            raise
+
+    def request_referencing_symbols(self, file_path, line_number, column_number):
+        """Override to add timeout logging."""
+        start_time = time.time()
+        try:
+            result = super().request_referencing_symbols(file_path, line_number, column_number)
+            elapsed = time.time() - start_time
+            if elapsed > 10:  # Log slow requests
+                self.logger.log(f"Slow Erlang LS referencing symbols request: {elapsed:.1f}s", logging.INFO)
+            return result
+        except Exception as e:
+            elapsed = time.time() - start_time
+            self.logger.log(f"Erlang LS referencing symbols request failed after {elapsed:.1f}s: {e}", logging.WARNING)
+            raise

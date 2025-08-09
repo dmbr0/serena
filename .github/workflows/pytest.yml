@@ -58,6 +58,7 @@ jobs:
       - name: Install Erlang Language Server
         if: runner.os != 'Windows'
         shell: bash
+        timeout-minutes: 8
         run: |
           # Install rebar3 if not already available
           which rebar3 || (curl -fsSL https://github.com/erlang/rebar3/releases/download/3.23.0/rebar3 -o /tmp/rebar3 && chmod +x /tmp/rebar3 && sudo mv /tmp/rebar3 /usr/local/bin/rebar3)
@@ -90,12 +91,13 @@ jobs:
       # Until then, we use custom code to install swift. Sourcekit-lsp is installed automatically with swift
       - name: Install Swift with swiftly (macOS)
         if: runner.os == 'macOS'
+        timeout-minutes: 10
         run: |
           echo "=== Installing swiftly on macOS ==="
-          curl -O https://download.swift.org/swiftly/darwin/swiftly.pkg && \
-          installer -pkg swiftly.pkg -target CurrentUserHomeDirectory && \
-          ~/.swiftly/bin/swiftly init --quiet-shell-followup && \
-          . "${SWIFTLY_HOME_DIR:-$HOME/.swiftly}/env.sh" && \
+          curl -O https://download.swift.org/swiftly/darwin/swiftly.pkg
+          installer -pkg swiftly.pkg -target CurrentUserHomeDirectory
+          ~/.swiftly/bin/swiftly init --quiet-shell-followup
+          . "${SWIFTLY_HOME_DIR:-$HOME/.swiftly}/env.sh"
           hash -r
           swiftly install --use 6.1.2
           swiftly use 6.1.2
@@ -154,4 +156,5 @@ jobs:
         run: uv run poe lint
       - name: Test with pytest
         shell: bash
+        timeout-minutes: 45
         run: uv run poe test
